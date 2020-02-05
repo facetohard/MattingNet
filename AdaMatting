@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pdb
+from config_pool.utils import tensor2Img
 
-from lib.nn import SynchronizedBatchNorm2d
+from gen_module.net.sunbiao.lib.nn import SynchronizedBatchNorm2d
 
 bn_dict = {
     'norm_bn': nn.BatchNorm2d,
@@ -359,33 +360,33 @@ class ADecoder(ResNet):
         return conv4_up
 
 class RefineModule(nn.Module):
-    def __init__(self, in_channels, iteration=3, norm_layer=None):
+    def __init__(self, in_channels, hidden_channels, iteration=3, norm_layer=None):
         super(RefineModule, self).__init__()
         norm_layer = bn_dict[norm_layer]
         self.res_layer = nn.Sequential(
             BasicBlock(inplanes=in_channels, planes=in_channels, norm_layer=norm_layer),
             BasicBlock(inplanes=in_channels, planes=in_channels, norm_layer=norm_layer),
         )
-        self.conv_lstm = ConvLSTM(input_size=in_channels, hidden_size=in_channels, kernel_size=3)
+        self.conv_lstm = ConvLSTM(input_size=in_channels, hidden_size=hidden_channels, kernel_size=3)
         self.iteration = iteration
 
-    def forward(self, x):
-        prev_state = None
-        for idx in range(self.iteration):
-            x = self.res_layer(x)
-            prev_state = self.conv_lstm(x, prev_state)
-            x = prev_state[0]
-        return x
+    def forward(self, x, prev_state):
+        x = self.res_layer(x)
+        prev_state = self.conv_lstm(x, prev_state)
+        return prev_state
 
 
 
 class AdaMattingNet(nn.Module):
-    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], sigma=[4, 4], stage='train', norm_layer=None, use_pu=False):
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], sigma=[4, 4], stage='train', norm_layer=None, use_pu=False,
+                 model_name=None, pu_channels=5, lstm_iter=3, raw_output=False):
         super(AdaMattingNet, self).__init__()
         norm_layer = norm_layer.lower()
+        self.raw_output = raw_output
         # base config
         self.inplanes = 64
         self.dilation = 1
+        self.lstm_iter = lstm_iter
 
         # self.sigma = nn.Linear(2, 1, bias=False)
         # self.sigma.weight = nn.Parameter(torch.Tensor([sigma]))
@@ -402,7 +403,7 @@ class AdaMattingNet(nn.Module):
 
         self.use_pu = use_pu
         if self.use_pu:
-            self.PU = RefineModule(3+1+3, norm_layer=norm_layer)
+            self.PU = RefineModule(5, hidden_channels=pu_channels, norm_layer=norm_layer)
 
         # ==== test use syn bn in all layer
         # for layer_name, m in self.named_modules():
@@ -418,6 +419,9 @@ class AdaMattingNet(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, SynchronizedBatchNorm2d)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+        if model_name is not None:
+            checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
+            self.load_state_dict(checkpoint)
 
 
     def forward(self, x):
@@ -426,16 +430,25 @@ class AdaMattingNet(nn.Module):
         out_alpha = self.A_decoder(encoder_list)
 
         if self.use_pu:
+            trimap = F.softmax(out_trimap)
+            trimap = torch.argmax(trimap, dim=1).unsqueeze(1).float()
             img = x[:, :3, ...]
-
-            refine_input = torch.cat([img, out_alpha, out_trimap], dim=1)
-            out_alpha = self.PU(refine_input)
-
+            prev_state = None
+            for idx in range(self.lstm_iter):
+                refine_input = torch.cat([img, out_alpha, trimap], dim=1)
+                prev_state = self.PU(refine_input, prev_state)
+                out_alpha = torch.mean(prev_state[0], dim=1, keepdim=True)
 
         if self.encoder.training:
             return out_alpha, out_trimap, self.sigma
         else:
-            return out_alpha, out_trimap
+            if self.raw_output:
+                return out_alpha, out_trimap
+            else:
+                out_trimap_arg = torch.argmax(out_trimap, dim=1).unsqueeze(1).float()
+                out_alpha = torch.where(out_trimap_arg == 1, out_alpha, out_trimap_arg)
+                out_alpha = torch.clamp(out_alpha, 0, 1)
+                return out_alpha, out_trimap
 
 if __name__ == '__main__':
     aa = torch.ones((1, 4, 320, 320)).float().cuda()
